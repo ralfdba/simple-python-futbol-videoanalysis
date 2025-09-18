@@ -43,6 +43,8 @@ Dependencias principales:
 - `pandas`
 - `xlsxwriter`
 - `python-dotenv`
+- `pillow`
+- `PyQt5`
 
 ---
 

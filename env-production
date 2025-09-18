@@ -1,0 +1,5 @@
+VIDEOS_DIR=/ruta/videos
+GLOB_PATTERN=*.mp4
+OUTPUT_DIR=./exports
+FPS_SAMPLE=5
+HIST_JUMP=0.6

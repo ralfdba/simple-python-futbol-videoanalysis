@@ -1,17 +1,17 @@
 # -*- coding: utf-8 -*-
 # GUI de anotación de jugadas con PyQt5
-# Controles:
-#   Botones: Gol, Tiro, Pase, Falta, Amarilla, Roja, Pausa/Reanudar, Siguiente, Guardar
-#   Atajos:  g,t,p,f,o,r, Espacio (pausa), n (siguiente), s (guardar)
-#   Campos:  Equipo, Jugador (se guardan por evento)
+# Novedades:
+#  - Botones: «–5s» y «+5s»
+#  - Control de velocidad: 0.5x / 1x / 2x
+#  - Timeline clicable (slider)
+#  - Marcas de eventos (ticks) dibujadas con QPainter sobre el timeline
 #
-# .env soportado:
-#   VIDEOS=lista separada por comas o saltos de línea
-#   MATCH_IDS=lista paralela opcional
-#   VIDEOS_DIR=directorio si no usas VIDEOS
-#   GLOB_PATTERN=*.mp4 (por defecto)
-#   OUTPUT_DIR=./exports
-#   OUTPUT_SUFFIX=_jugadas.xlsx
+# Atajos:
+#   g,t,p,f,o,r: marcar eventos
+#   Espacio: Pausa/Reanudar
+#   ← / → : –5s / +5s
+#   n: Siguiente video
+#   s: Guardar Excel
 
 import os
 import sys
@@ -83,12 +83,107 @@ def load_videos_from_env():
     return videos, match_ids, output_dir, output_suffix
 
 
+# -------------------- Slider clicable con marcas --------------------
+class MarkerSlider(QtWidgets.QSlider):
+    """
+    QSlider horizontal que:
+      - Permite click directo para hacer seek
+      - Dibuja marcas (ticks) de eventos con QPainter
+    """
+    clickedValue = QtCore.pyqtSignal(int)
+
+    def __init__(self, orientation=QtCore.Qt.Horizontal, parent=None):
+        super().__init__(orientation, parent)
+        self.setMouseTracking(True)
+        self.markers: List[int] = []  # frames de eventos
+        self._tick_height = 10
+        self._tick_pen = QtGui.QPen(QtGui.QColor(255, 70, 70), 2)  # rojo suave
+        self._tick_hover_pen = QtGui.QPen(QtGui.QColor(255, 170, 0), 2)  # hover (opcional)
+        self._hover = False
+
+    def setMarkers(self, frames: List[int]):
+        """Actualiza la lista de frames con marcas y repinta."""
+        self.markers = sorted(set(frames))
+        self.update()
+
+    def mouseMoveEvent(self, event: QtGui.QMouseEvent) -> None:
+        self._hover = True
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event: QtCore.QEvent) -> None:
+        self._hover = False
+        super().leaveEvent(event)
+
+    def mousePressEvent(self, event: QtGui.QMouseEvent) -> None:
+        if event.button() == QtCore.Qt.LeftButton:
+            # mapear posición x --> valor (frame)
+            groove_left, groove_width = self._groove_geom()
+            # evitar división por cero
+            if groove_width <= 0 or self.maximum() == self.minimum():
+                super().mousePressEvent(event)
+                return
+            x = event.pos().x()
+            # clamp dentro del groove
+            x = max(groove_left, min(x, groove_left + groove_width))
+            ratio = (x - groove_left) / float(groove_width)
+            val = self.minimum() + int(round(ratio * (self.maximum() - self.minimum())))
+            self.setValue(val)
+            self.clickedValue.emit(val)
+            event.accept()
+        super().mousePressEvent(event)
+
+    def paintEvent(self, event: QtGui.QPaintEvent) -> None:
+        # Dibujo base del slider
+        super().paintEvent(event)
+
+        # Dibuja las marcas encima
+        if not self.markers:
+            return
+
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.Antialiasing, True)
+
+        groove_left, groove_width = self._groove_geom()
+        if groove_width <= 0 or self.maximum() == self.minimum():
+            return
+
+        # Línea superior discreta (opcional): comentar si no la quieres
+        # base_pen = QtGui.QPen(QtGui.QColor(220, 220, 220), 1)
+        # painter.setPen(base_pen)
+        # painter.drawLine(groove_left, 0, groove_left + groove_width, 0)
+
+        # Selecciona el color según hover
+        pen = self._tick_hover_pen if self._hover else self._tick_pen
+        painter.setPen(pen)
+
+        # Calcular y dibujar cada tick
+        for frame in self.markers:
+            frame = max(self.minimum(), min(frame, self.maximum()))
+            ratio = (frame - self.minimum()) / float(self.maximum() - self.minimum())
+            x = groove_left + int(round(ratio * groove_width))
+            # tick vertical de altura _tick_height en la parte superior del widget
+            painter.drawLine(x, 0, x, self._tick_height)
+
+        painter.end()
+
+    def _groove_geom(self) -> tuple:
+        """
+        Devuelve (left_x, width) del groove (canal) del slider,
+        para mapear valores -> posiciones en píxeles de forma robusta.
+        """
+        opt = QtWidgets.QStyleOptionSlider()
+        self.initStyleOption(opt)
+        groove = self.style().subControlRect(QtWidgets.QStyle.CC_Slider, opt,
+                                             QtWidgets.QStyle.SC_SliderGroove, self)
+        return groove.left(), groove.width()
+
+
 # -------------------- Ventana principal --------------------
 class AnnotatorWindow(QtWidgets.QMainWindow):
     def __init__(self, videos: List[str], match_ids: Optional[List[str]], output_dir: str, output_suffix: str):
         super().__init__()
         self.setWindowTitle("Anotador de Jugadas - PyQt5")
-        self.resize(1100, 720)
+        self.resize(1120, 780)
 
         self.videos = [Path(v) for v in videos]
         self.match_ids = match_ids or []
@@ -99,11 +194,12 @@ class AnnotatorWindow(QtWidgets.QMainWindow):
         self.timer = QtCore.QTimer(self)
         self.timer.timeout.connect(self._next_frame)
         self.playing = False
+        self.playback_speed = 1.0  # 0.5x, 1x, 2x
         self.fps = 25.0
         self.total_frames = 0
         self.current_video_idx = -1
         self.current_match_id: Optional[str] = None
-        self.events: List[dict] = []
+        self.events: List[dict] = []   # cada evento guarda 'extra.frame' con el frame
 
         self._build_ui()
         self._build_shortcuts()
@@ -126,12 +222,21 @@ class AnnotatorWindow(QtWidgets.QMainWindow):
         self.video_label.setAlignment(QtCore.Qt.AlignCenter)
         layout.addWidget(self.video_label)
 
+        # Timeline clicable con marcas
+        self.timeline = MarkerSlider(QtCore.Qt.Horizontal)
+        self.timeline.setMinimum(0)
+        self.timeline.setMaximum(1)  # se ajusta al cargar video
+        self.timeline.setSingleStep(1)
+        self.timeline.clickedValue.connect(self._seek_to_value)
+        self.timeline.valueChanged.connect(self._timeline_drag_seek)
+        layout.addWidget(self.timeline)
+
         # Progreso + info
         progress_layout = QtWidgets.QHBoxLayout()
         self.progress = QtWidgets.QProgressBar()
         self.progress.setTextVisible(True)
         self.info_label = QtWidgets.QLabel("Listo")
-        self.info_label.setMinimumWidth(300)
+        self.info_label.setMinimumWidth(320)
         progress_layout.addWidget(self.progress, stretch=1)
         progress_layout.addWidget(self.info_label)
         layout.addLayout(progress_layout)
@@ -162,14 +267,20 @@ class AnnotatorWindow(QtWidgets.QMainWindow):
             btns.addWidget(b)
         layout.addLayout(btns)
 
-        # Botones de control
+        # Controles: pausa, salto ±5s, velocidad, siguiente, guardar
         ctrl = QtWidgets.QHBoxLayout()
         self.btn_play = QtWidgets.QPushButton("Pausa (Espacio)")
+        self.btn_rew5 = QtWidgets.QPushButton("« –5s")
+        self.btn_fwd5 = QtWidgets.QPushButton("+5s »")
+        self.speed_label = QtWidgets.QLabel("Velocidad:")
+        self.speed_combo = QtWidgets.QComboBox()
+        self.speed_combo.addItems(["0.5x", "1x", "2x"])
+        self.speed_combo.setCurrentText("1x")
         self.btn_next = QtWidgets.QPushButton("Siguiente (n)")
         self.btn_save = QtWidgets.QPushButton("Guardar (s)")
-        ctrl.addWidget(self.btn_play)
-        ctrl.addWidget(self.btn_next)
-        ctrl.addWidget(self.btn_save)
+
+        for w in [self.btn_play, self.btn_rew5, self.btn_fwd5, self.speed_label, self.speed_combo, self.btn_next, self.btn_save]:
+            ctrl.addWidget(w)
         ctrl.addStretch()
         layout.addLayout(ctrl)
 
@@ -182,6 +293,9 @@ class AnnotatorWindow(QtWidgets.QMainWindow):
         self.btn_red.clicked.connect(lambda: self._mark(("foul", "red_card")))
 
         self.btn_play.clicked.connect(self.toggle_play)
+        self.btn_rew5.clicked.connect(lambda: self._seek_seconds(-5))
+        self.btn_fwd5.clicked.connect(lambda: self._seek_seconds(+5))
+        self.speed_combo.currentTextChanged.connect(self._change_speed)
         self.btn_next.clicked.connect(self.next_video)
         self.btn_save.clicked.connect(self.save_current)
 
@@ -195,6 +309,8 @@ class AnnotatorWindow(QtWidgets.QMainWindow):
         QtWidgets.QShortcut(QtGui.QKeySequence("Space"), self, activated=self.toggle_play)
         QtWidgets.QShortcut(QtGui.QKeySequence("N"), self, activated=self.next_video)
         QtWidgets.QShortcut(QtGui.QKeySequence("S"), self, activated=self.save_current)
+        QtWidgets.QShortcut(QtGui.QKeySequence("Left"), self, activated=lambda: self._seek_seconds(-5))
+        QtWidgets.QShortcut(QtGui.QKeySequence("Right"), self, activated=lambda: self._seek_seconds(+5))
 
     # ---------- Video ----------
     def open_video(self, path: Path, match_id: Optional[str]):
@@ -212,14 +328,22 @@ class AnnotatorWindow(QtWidgets.QMainWindow):
         self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT))
         self.current_match_id = match_id or path.stem
         self.events = []
+
         self.progress.setMaximum(max(1, self.total_frames))
         self.progress.setValue(0)
-        self.info_label.setText(f"Video: {path.name} | MATCH_ID: {self.current_match_id} | FPS: {self.fps:.2f} | Frames: {self.total_frames}")
+        self.timeline.setMaximum(max(1, self.total_frames))
+        self.timeline.setValue(0)
+        self.timeline.setMarkers([])  # limpiar marcas
+
+        self.info_label.setText(
+            f"Video: {path.name} | MATCH_ID: {self.current_match_id} | FPS: {self.fps:.2f} | Frames: {self.total_frames}"
+        )
 
         # Reproducir
         self.playing = True
         self.btn_play.setText("Pausa (Espacio)")
-        self.timer.start(max(1, int(1000 / max(1, int(self.fps)))))  # ~tiempo real
+        self._update_timer_interval()
+        self.timer.start()
         return True
 
     def toggle_play(self):
@@ -228,10 +352,23 @@ class AnnotatorWindow(QtWidgets.QMainWindow):
         self.playing = not self.playing
         if self.playing:
             self.btn_play.setText("Pausa (Espacio)")
-            self.timer.start(max(1, int(1000 / max(1, int(self.fps)))))
+            self._update_timer_interval()
+            self.timer.start()
         else:
             self.btn_play.setText("Reanudar (Espacio)")
             self.timer.stop()
+
+    def _update_timer_interval(self):
+        # Intervalo ≈ 1000 / (fps * speed)
+        interval = max(1, int(1000 / max(1e-6, self.fps * self.playback_speed)))
+        self.timer.setInterval(interval)
+
+    def _change_speed(self, text: str):
+        try:
+            self.playback_speed = float(text.replace("x", ""))
+        except Exception:
+            self.playback_speed = 1.0
+        self._update_timer_interval()
 
     def _next_frame(self):
         if not self.cap:
@@ -260,9 +397,66 @@ class AnnotatorWindow(QtWidgets.QMainWindow):
         pix = QtGui.QPixmap.fromImage(qimg).scaled(960, 540, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
         self.video_label.setPixmap(pix)
 
-        # Progreso
+        # Progreso + timeline
         self.progress.setValue(min(self.total_frames, fno))
         self.progress.setFormat(f"{ts_to_clock(sec)}")
+        self.timeline.blockSignals(True)
+        self.timeline.setValue(min(self.total_frames, fno))
+        self.timeline.blockSignals(False)
+
+    # ---------- Seeking ----------
+    def _seek_seconds(self, delta_s: int):
+        if not self.cap:
+            return
+        # frame actual
+        current_f = int(self.cap.get(cv2.CAP_PROP_POS_FRAMES))
+        # destino
+        target_f = int(current_f + delta_s * self.fps)
+        self._seek_to_frame(target_f)
+
+
+    def _seek_to_value(self, frame_val: int):
+        # click en timeline
+        self._seek_to_frame(frame_val)
+
+    def _timeline_drag_seek(self, frame_val: int):
+        # al arrastrar el slider, muestra el frame correspondiente en pausa (scrubbing)
+        if not self.cap:
+            return
+        if not self.playing:
+            self._seek_to_frame(frame_val, keep_playing=False)
+
+    def _seek_to_frame(self, frame_idx: int, keep_playing: Optional[bool] = None):
+        if not self.cap:
+            return
+        frame_idx = max(0, min(frame_idx, self.total_frames - 1))
+        self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+        # fuerza render inmediato
+        ok, frame = self.cap.read()
+        if ok:
+            # retrocede un frame para que el próximo _next_frame no se lo salte
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            sec = frame_idx / max(1e-6, self.fps)
+            disp = frame.copy()
+            cv2.putText(disp, f"{ts_to_clock(sec)} (frame {frame_idx}/{self.total_frames})",
+                        (20, 40), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255,255,255), 2)
+            rgb = cv2.cvtColor(disp, cv2.COLOR_BGR2RGB)
+            h, w, ch = rgb.shape
+            bytes_per_line = ch * w
+            qimg = QtGui.QImage(rgb.data, w, h, bytes_per_line, QtGui.QImage.Format_RGB888)
+            pix = QtGui.QPixmap.fromImage(qimg).scaled(960, 540, QtCore.Qt.KeepAspectRatio, QtCore.Qt.SmoothTransformation)
+            self.video_label.setPixmap(pix)
+            self.progress.setValue(frame_idx)
+            self.progress.setFormat(f"{ts_to_clock(sec)}")
+            self.timeline.blockSignals(True)
+            self.timeline.setValue(frame_idx)
+            self.timeline.blockSignals(False)
+
+        if keep_playing is not None:
+            if keep_playing and not self.playing:
+                self.toggle_play()
+            elif not keep_playing and self.playing:
+                self.toggle_play()
 
     # ---------- Anotación ----------
     def _mark(self, label: Tuple[str, Optional[str]]):
@@ -288,6 +482,9 @@ class AnnotatorWindow(QtWidgets.QMainWindow):
         }
         self.events.append(event)
         self.info_label.setText(f"Marcado: {event['action']}{('/'+event['outcome']) if event['outcome'] else ''} | {event['extra']['video_time']} | total={len(self.events)}")
+        # Actualiza marcas en timeline
+        marker_frames = [e["extra"]["frame"] for e in self.events if "extra" in e and "frame" in e["extra"]]
+        self.timeline.setMarkers(marker_frames)
 
     # ---------- Guardado / Navegación ----------
     def save_current(self):

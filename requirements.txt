@@ -2,3 +2,5 @@ opencv-python
 pandas
 xlsxwriter
 python-dotenv
+pillow
+PyQt5
